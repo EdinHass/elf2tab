@@ -162,6 +162,61 @@ fn trim_nobits_from_segment(
     }
 }
 
+/// Get the relocation data for a section of a relocatable RISC-V app.
+///
+/// For ARM apps, elf2tab includes the `.rel.<section>` sections as they are: a
+/// pair of 32-bit words for each address that crt0 must fix. RISC-V apps have
+/// `.rela.<section>` sections instead (kept with `--emit-relocs`), with a third
+/// word per entry. So for RISC-V, keep the first two words of each entry that
+/// stores a 32-bit address (`R_RISCV_32`). A missing weak symbol is NULL
+/// wherever the app is, so entries for undefined and absolute symbols are left
+/// out.
+fn riscv_relocation_data(
+    elf_file: &elf::ElfBytes<elf::endian::AnyEndian>,
+    elf_sections: &[(String, elf::section::SectionHeader)],
+    section_name: &str,
+) -> Vec<u8> {
+    let mut relocation_data: Vec<u8> = Vec::new();
+    if elf_file.ehdr.e_machine != elf::abi::EM_RISCV {
+        return relocation_data;
+    }
+
+    // relocation_section_name = ".rela" + section_name
+    let relocation_section_name = format!(".rela{}", section_name);
+    let relocation_shdr = match elf_sections
+        .iter()
+        .find(|(sh_name, _)| *sh_name == relocation_section_name)
+    {
+        Some((_, shdr)) => shdr,
+        None => return relocation_data,
+    };
+
+    let (symbol_table, _) = elf_file
+        .symbol_table()
+        .expect("Failed to parse symbol table")
+        .expect("ELF has no symbol table");
+    let relocations = elf_file
+        .section_data_as_relas(relocation_shdr)
+        .expect("Failed to parse relocations");
+    for rela in relocations {
+        // Only entries that store a 32-bit address.
+        if rela.r_type != elf::abi::R_RISCV_32 {
+            continue;
+        }
+        // Leave NULL (a missing weak symbol) and fixed addresses as they are.
+        let symbol = symbol_table
+            .get(rela.r_sym as usize)
+            .expect("Failed to parse symbol");
+        if symbol.st_shndx == elf::abi::SHN_UNDEF || symbol.st_shndx == elf::abi::SHN_ABS {
+            continue;
+        }
+        let r_info = (rela.r_sym << 8) | rela.r_type;
+        relocation_data.extend_from_slice(&(rela.r_offset as u32).to_le_bytes());
+        relocation_data.extend_from_slice(&r_info.to_le_bytes());
+    }
+    relocation_data
+}
+
 /// Helper function to determine if a section is within a specific segment.
 ///
 /// Based on the function `section_in_segment` in
@@ -958,11 +1013,23 @@ pub fn elf_to_tbf(
                         });
                     relocation_binary.extend(rel_data);
 
+                    // RISC-V apps have `.rela` sections instead.
+                    let rela_data = riscv_relocation_data(&elf_file, &elf_sections, sh_name);
+                    relocation_binary.extend(&rela_data);
+
                     if verbose && !rel_data.is_empty() {
                         println!(
                             "      Including relocation data ({0}). Length: {1} ({1:#x}) bytes.",
                             relocation_section_name,
                             rel_data.len(),
+                        );
+                    }
+
+                    if verbose && !rela_data.is_empty() {
+                        println!(
+                            "      Including relocation data (.rela{0}). Length: {1} ({1:#x}) bytes.",
+                            sh_name,
+                            rela_data.len(),
                         );
                     }
                 }
